@@ -1,0 +1,151 @@
+name: Release Roblox Android
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: roblox-android-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Python dependencies
+        run: python -m pip install --upgrade pip -r requirements.txt
+
+      - name: Install apkeep
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          python scripts/install_apkeep.py --bin-dir "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/apkeep" --version
+
+      - name: Install Android merge tools
+        run: |
+          python scripts/install_android_tools.py --tools-dir "$RUNNER_TEMP/android-tools" --build-tools-version "36.1.0"
+          echo "$RUNNER_TEMP/android-tools/bin" >> "$GITHUB_PATH"
+
+      - name: Sync Roblox package
+        id: sync
+        run: python sync_roblox.py
+
+      - name: Prepare merge signing
+        if: steps.sync.outputs.has_update == 'true'
+        shell: bash
+        env:
+          MERGE_KEYSTORE: ${{ runner.temp }}/mergeapks/mergeapks.keystore
+          MERGE_SIGN_PROPS: ${{ runner.temp }}/mergeapks/mergeapks.sign.properties
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$MERGE_KEYSTORE")"
+          keytool -genkeypair \
+            -keystore "$MERGE_KEYSTORE" \
+            -storepass "mergeapks123!" \
+            -keypass "mergeapks123!" \
+            -alias "mergeapks" \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 3650 \
+            -dname "CN=RB-APK, OU=GitHub Actions, O=RB-APK, L=NA, ST=NA, C=US"
+          python scripts/write_mergeapks_sign_properties.py \
+            --output "$MERGE_SIGN_PROPS" \
+            --keystore "$MERGE_KEYSTORE" \
+            --storepass "mergeapks123!" \
+            --alias "mergeapks" \
+            --keypass "mergeapks123!"
+
+      - name: Merge APK with apktool
+        if: steps.sync.outputs.has_update == 'true'
+        id: merge
+        env:
+          MERGEAPKS_SIGN_PROPERTIES: ${{ runner.temp }}/mergeapks/mergeapks.sign.properties
+        run: python sync_roblox.py --convert-archive "${{ steps.sync.outputs.artifact_path }}" --convert-method apktool --convert-output-dir merged-apks
+
+      - name: Generate release notes
+        if: steps.sync.outputs.has_update == 'true'
+        id: notes
+        shell: bash
+        env:
+          PACKAGE_NAME: com.roblox.client
+          VERSION_NAME: ${{ steps.sync.outputs.version_name }}
+          VERSION_CODE: ${{ steps.sync.outputs.version_code }}
+          SOURCE_NAME: ${{ steps.sync.outputs.source_name }}
+          XAPK_PATH: ${{ steps.sync.outputs.artifact_path }}
+          XAPK_SHA256: ${{ steps.sync.outputs.sha256 }}
+          MERGED_APK_PATH: ${{ steps.merge.outputs.converted_apk_path }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-notes
+          MERGED_SHA256="$(sha256sum "$MERGED_APK_PATH" | awk '{print $1}')"
+          NOTES_PATH="$PWD/release-notes/release.md"
+          python scripts/write_release_notes.py \
+            --output "$NOTES_PATH" \
+            --package-name "$PACKAGE_NAME" \
+            --version-name "$VERSION_NAME" \
+            --version-code "$VERSION_CODE" \
+            --source "$SOURCE_NAME" \
+            --xapk-name "$(basename "$XAPK_PATH")" \
+            --xapk-sha256 "$XAPK_SHA256" \
+            --merged-apk-name "$(basename "$MERGED_APK_PATH")" \
+            --merged-apk-sha256 "$MERGED_SHA256"
+          echo "notes_path=$NOTES_PATH" >> "$GITHUB_OUTPUT"
+          echo "merged_sha256=$MERGED_SHA256" >> "$GITHUB_OUTPUT"
+
+      - name: Create release
+        if: steps.sync.outputs.has_update == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.sync.outputs.tag_name }}
+          name: Roblox Android ${{ steps.sync.outputs.version_name }}
+          target_commitish: ${{ github.event.repository.default_branch }}
+          body_path: ${{ steps.notes.outputs.notes_path }}
+          files: |
+            ${{ steps.sync.outputs.artifact_path }}
+            ${{ steps.merge.outputs.converted_apk_path }}
+          fail_on_unmatched_files: true
+
+      - name: Configure git
+        if: steps.sync.outputs.has_update == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit latest version
+        if: steps.sync.outputs.has_update == 'true'
+        shell: bash
+        env:
+          VERSION_NAME: ${{ steps.sync.outputs.version_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          git add latest_version.txt
+          if git diff --cached --quiet; then
+            echo "latest_version.txt is unchanged."
+            exit 0
+          fi
+          git commit -m "chore: sync Roblox Android ${VERSION_NAME}"
+          git push origin "HEAD:${DEFAULT_BRANCH}"
