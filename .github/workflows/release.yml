@@ -85,6 +85,35 @@ jobs:
           MERGEAPKS_SIGN_PROPERTIES: ${{ runner.temp }}/mergeapks/mergeapks.sign.properties
         run: python sync_roblox.py --convert-archive "${{ steps.sync.outputs.artifact_path }}" --convert-method apktool --convert-output-dir merged-apks
 
+      - name: Prepare release assets
+        if: steps.sync.outputs.has_update == 'true'
+        id: assets
+        shell: bash
+        env:
+          SOURCE_ARTIFACT: ${{ steps.sync.outputs.artifact_path }}
+          MERGED_APK_PATH: ${{ steps.merge.outputs.converted_apk_path }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          RELEASE_APK_PATH="$PWD/release-assets/roblox.apk"
+          cp "$MERGED_APK_PATH" "$RELEASE_APK_PATH"
+
+          RELEASE_ARCHIVE_PATH=""
+          RELEASE_FILES="$RELEASE_APK_PATH"
+          if [[ "$SOURCE_ARTIFACT" != *.apk ]]; then
+            RELEASE_ARCHIVE_PATH="$PWD/release-assets/roblox.zapk"
+            cp "$SOURCE_ARTIFACT" "$RELEASE_ARCHIVE_PATH"
+            RELEASE_FILES="$RELEASE_ARCHIVE_PATH"$'\n'"$RELEASE_APK_PATH"
+          fi
+
+          {
+            echo "release_apk_path=$RELEASE_APK_PATH"
+            echo "release_archive_path=$RELEASE_ARCHIVE_PATH"
+            echo "release_files<<EOF"
+            printf '%s\n' "$RELEASE_FILES"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Generate release notes
         if: steps.sync.outputs.has_update == 'true'
         id: notes
@@ -94,26 +123,33 @@ jobs:
           VERSION_NAME: ${{ steps.sync.outputs.version_name }}
           VERSION_CODE: ${{ steps.sync.outputs.version_code }}
           SOURCE_NAME: ${{ steps.sync.outputs.source_name }}
-          XAPK_PATH: ${{ steps.sync.outputs.artifact_path }}
-          XAPK_SHA256: ${{ steps.sync.outputs.sha256 }}
-          MERGED_APK_PATH: ${{ steps.merge.outputs.converted_apk_path }}
+          RELEASE_ARCHIVE_PATH: ${{ steps.assets.outputs.release_archive_path }}
+          RELEASE_APK_PATH: ${{ steps.assets.outputs.release_apk_path }}
         run: |
           set -euo pipefail
           mkdir -p release-notes
-          MERGED_SHA256="$(sha256sum "$MERGED_APK_PATH" | awk '{print $1}')"
+          APK_SHA256="$(sha256sum "$RELEASE_APK_PATH" | awk '{print $1}')"
           NOTES_PATH="$PWD/release-notes/release.md"
+          EXTRA_ARGS=()
+          if [[ -n "$RELEASE_ARCHIVE_PATH" ]]; then
+            ARCHIVE_SHA256="$(sha256sum "$RELEASE_ARCHIVE_PATH" | awk '{print $1}')"
+            EXTRA_ARGS+=(
+              --archive-name "$(basename "$RELEASE_ARCHIVE_PATH")"
+              --archive-sha256 "$ARCHIVE_SHA256"
+            )
+            echo "archive_sha256=$ARCHIVE_SHA256" >> "$GITHUB_OUTPUT"
+          fi
           python scripts/write_release_notes.py \
             --output "$NOTES_PATH" \
             --package-name "$PACKAGE_NAME" \
             --version-name "$VERSION_NAME" \
             --version-code "$VERSION_CODE" \
             --source "$SOURCE_NAME" \
-            --xapk-name "$(basename "$XAPK_PATH")" \
-            --xapk-sha256 "$XAPK_SHA256" \
-            --merged-apk-name "$(basename "$MERGED_APK_PATH")" \
-            --merged-apk-sha256 "$MERGED_SHA256"
+            --apk-name "$(basename "$RELEASE_APK_PATH")" \
+            --apk-sha256 "$APK_SHA256" \
+            "${EXTRA_ARGS[@]}"
           echo "notes_path=$NOTES_PATH" >> "$GITHUB_OUTPUT"
-          echo "merged_sha256=$MERGED_SHA256" >> "$GITHUB_OUTPUT"
+          echo "apk_sha256=$APK_SHA256" >> "$GITHUB_OUTPUT"
 
       - name: Create release
         if: steps.sync.outputs.has_update == 'true'
@@ -123,9 +159,7 @@ jobs:
           name: Roblox Android ${{ steps.sync.outputs.version_name }}
           target_commitish: ${{ github.event.repository.default_branch }}
           body_path: ${{ steps.notes.outputs.notes_path }}
-          files: |
-            ${{ steps.sync.outputs.artifact_path }}
-            ${{ steps.merge.outputs.converted_apk_path }}
+          files: ${{ steps.assets.outputs.release_files }}
           fail_on_unmatched_files: true
 
       - name: Configure git
