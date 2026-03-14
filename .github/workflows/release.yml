@@ -51,7 +51,14 @@ jobs:
 
       - name: Sync Roblox package
         id: sync
-        run: python sync_roblox.py
+        shell: bash
+        run: |
+          set -euo pipefail
+          SYNC_ARGS=()
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            SYNC_ARGS+=(--force-download)
+          fi
+          python sync_roblox.py "${SYNC_ARGS[@]}"
 
       - name: Prepare merge signing
         if: steps.sync.outputs.has_update == 'true'
