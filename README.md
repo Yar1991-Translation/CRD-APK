@@ -7,7 +7,7 @@ This repository automatically monitors the latest Roblox Android package (`com.r
 - `sync_roblox.py`: Checks the latest version, downloads the artifact, normalizes split APK output when needed, calculates SHA256, and exports GitHub Actions outputs.
 - `mergeapks.py`: Uses `apktool`, `zipalign`, and `apksigner` to merge split APK files into one signed APK.
 - `scripts/`: Small helper installers and release-note generators used by GitHub Actions.
-- `.github/workflows/release.yml`: Runs daily or on demand, installs dependencies and Android tooling on the runner, renames release assets to `roblox.zapk` and `roblox.apk`, commits `latest_version.txt`, and creates the GitHub Release. Manual runs force a refresh so a missing Release can be backfilled.
+- `.github/workflows/release.yml`: Runs hourly or on demand, installs dependencies and Android tooling on the runner, renames release assets to `roblox.zapk` and `roblox.apk`, commits `latest_version.txt`, and creates the GitHub Release. Manual runs force a refresh so a missing Release can be backfilled.
 - `latest_version.txt`: Stores the last released Roblox Android version.
 
 ## How it works
