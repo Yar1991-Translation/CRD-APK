@@ -16,6 +16,7 @@ APKTOOL_RELEASE_API = "https://api.github.com/repos/iBotPeaches/Apktool/releases
 ANDROID_REPO_XML = "https://dl.google.com/android/repository/repository2-1.xml"
 RETRY_COUNT = 3
 RETRY_DELAY_SECONDS = 2
+DEFAULT_BUILD_TOOLS_VERSION = "36.1.0"
 
 
 def parse_args() -> argparse.Namespace:
@@ -23,8 +24,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tools-dir", type=Path, required=True, help="Directory for downloaded tools.")
     parser.add_argument(
         "--build-tools-version",
-        default="36.1.0",
-        help="Android build-tools version to install.",
+        default=DEFAULT_BUILD_TOOLS_VERSION,
+        help="Preferred Android build-tools version to install.",
     )
     return parser.parse_args()
 
@@ -52,24 +53,60 @@ def fetch_json(url: str) -> dict:
     return json.loads(request_bytes(url).decode("utf-8"))
 
 
-def fetch_build_tools_url(version: str) -> str:
+def local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def child_text(element: ET.Element, name: str) -> str:
+    for child in element.iter():
+        if local_name(child.tag) == name and child.text:
+            return child.text.strip()
+    return ""
+
+
+def find_build_tools_archives() -> dict[str, str]:
     root = ET.fromstring(request_bytes(ANDROID_REPO_XML))
-    namespace = {
-        "sdk": "http://schemas.android.com/sdk/android/repo/repository2/01",
-        "common": "http://schemas.android.com/repository/android/common/01",
-    }
-    package_path = f"build-tools;{version}"
-    for package in root.findall("sdk:remotePackage", namespace):
-        if package.attrib.get("path") != package_path:
+    archives: dict[str, str] = {}
+
+    for package in root.iter():
+        if local_name(package.tag) != "remotePackage":
             continue
-        for archive in package.findall("sdk:archives/sdk:archive", namespace):
-            host_os = archive.findtext("common:host-os", default="", namespaces=namespace)
-            if host_os != "linux":
+        package_path = package.attrib.get("path", "")
+        if not package_path.startswith("build-tools;"):
+            continue
+
+        version = package_path.split(";", 1)[1]
+        for archive in package.iter():
+            if local_name(archive.tag) != "archive":
                 continue
-            relative_url = archive.findtext("sdk:complete/common:url", default="", namespaces=namespace)
+            host_os = child_text(archive, "host-os")
+            if host_os and host_os != "linux":
+                continue
+            relative_url = child_text(archive, "url")
             if relative_url:
-                return f"https://dl.google.com/android/repository/{relative_url}"
-    raise SystemExit(f"Could not find Linux build-tools archive for version {version}")
+                archives[version] = f"https://dl.google.com/android/repository/{relative_url}"
+                break
+    return archives
+
+
+def version_key(version: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in version.split("."))
+
+
+def resolve_build_tools_download(preferred_version: str) -> tuple[str, str]:
+    archives = find_build_tools_archives()
+    if not archives:
+        raise SystemExit("Could not find any Linux Android build-tools archives.")
+
+    if preferred_version in archives:
+        return preferred_version, archives[preferred_version]
+
+    resolved_version = max(archives, key=version_key)
+    print(
+        f"Preferred build-tools {preferred_version} is unavailable; "
+        f"falling back to {resolved_version}.",
+    )
+    return resolved_version, archives[resolved_version]
 
 
 def create_exec_wrapper(wrapper_path: Path, target_path: Path) -> None:
@@ -125,8 +162,9 @@ def main() -> int:
     )
     apktool_wrapper.chmod(apktool_wrapper.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
-    build_tools_zip = download_dir / f"build-tools-{args.build_tools_version}.zip"
-    download(fetch_build_tools_url(args.build_tools_version), build_tools_zip)
+    resolved_version, build_tools_url = resolve_build_tools_download(args.build_tools_version)
+    build_tools_zip = download_dir / f"build-tools-{resolved_version}.zip"
+    download(build_tools_url, build_tools_zip)
     with zipfile.ZipFile(build_tools_zip) as archive:
         archive.extractall(build_tools_dir)
 
@@ -137,6 +175,7 @@ def main() -> int:
 
     print(bin_dir)
     print(build_tools_dir)
+    print(resolved_version)
     return 0
 
 
