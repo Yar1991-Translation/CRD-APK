@@ -10,13 +10,19 @@ import shutil
 import subprocess
 import sys
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
+from tempfile import TemporaryDirectory
 from typing import Iterable
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+try:
+    from pyaxmlparser import APK
+except ImportError:  # pragma: no cover - exercised when dependencies are missing
+    APK = None
 
 
 APP_NAME = "Roblox"
@@ -53,6 +59,7 @@ MERGED_DIR = ROOT / "merged-apks"
 MERGEAPKS_SCRIPT = ROOT / "mergeapks.py"
 MERGEAPKS_SIGN_PROPERTIES_ENV = "MERGEAPKS_SIGN_PROPERTIES"
 SUPPORTED_SPLIT_ARCHIVE_SUFFIXES = {".xapk", ".apks", ".zapk"}
+ANDROID_NAMESPACE = "{http://schemas.android.com/apk/res/android}"
 
 
 class SyncError(RuntimeError):
@@ -78,6 +85,14 @@ class ReleaseInfo:
     @property
     def artifact_name(self) -> str:
         return f"roblox-android-v{self.version_name}{self.file_ext}"
+
+
+@dataclass(frozen=True)
+class ApkManifestInfo:
+    package_name: str
+    version_name: str
+    version_code: str
+    split_name: str | None = None
 
 
 def build_session() -> requests.Session:
@@ -193,6 +208,66 @@ def read_archive_manifest(archive: zipfile.ZipFile) -> dict | None:
     return None
 
 
+def require_apk_parser() -> None:
+    if APK is None:
+        raise SyncError(
+            "pyaxmlparser is required to inspect APK manifests. "
+            "Install dependencies from requirements.txt before running this command."
+        )
+
+
+def coerce_text(value: object) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def read_apk_manifest_info(apk_path: Path) -> ApkManifestInfo:
+    require_apk_parser()
+    parsed_apk = APK(str(apk_path))
+    if not parsed_apk.is_valid_APK():
+        raise SyncError(f"Invalid APK manifest: {apk_path}")
+
+    manifest_root = parsed_apk.get_android_manifest_xml()
+    if manifest_root is None:
+        raise SyncError(f"Could not decode AndroidManifest.xml from {apk_path}")
+
+    package_name = coerce_text(manifest_root.attrib.get("package") or parsed_apk.package)
+    version_name = coerce_text(
+        manifest_root.attrib.get(ANDROID_NAMESPACE + "versionName")
+        or getattr(parsed_apk, "version_name", "")
+    )
+    version_code = coerce_text(
+        manifest_root.attrib.get(ANDROID_NAMESPACE + "versionCode")
+        or getattr(parsed_apk, "version_code", "")
+    )
+    split_name = coerce_text(manifest_root.attrib.get("split")) or None
+    return ApkManifestInfo(
+        package_name=package_name,
+        version_name=version_name,
+        version_code=version_code,
+        split_name=split_name,
+    )
+
+
+def parse_archive_manifest_info(manifest: dict | None) -> ApkManifestInfo | None:
+    if not manifest or not isinstance(manifest, dict):
+        return None
+
+    package_name = coerce_text(manifest.get("package_name"))
+    version_name = coerce_text(manifest.get("version_name"))
+    version_code = coerce_text(manifest.get("version_code"))
+    if not version_name or not version_code:
+        return None
+
+    return ApkManifestInfo(
+        package_name=package_name,
+        version_name=version_name,
+        version_code=version_code,
+        split_name=None,
+    )
+
+
 def resolve_manifest_base_entry(
     apk_entries: list[str],
     manifest: dict | None,
@@ -254,6 +329,97 @@ def choose_primary_apk_entry(
             return entry, "split_package"
 
     return sorted(apk_entries)[0], "split_package"
+
+
+def choose_primary_apk_path(apk_paths: list[Path]) -> tuple[Path, str]:
+    if len(apk_paths) == 1:
+        return apk_paths[0], "single_apk"
+
+    normalized_paths = {path.name: path for path in apk_paths}
+    primary_name, mode = choose_primary_apk_entry(list(normalized_paths.keys()), None)
+    return normalized_paths[primary_name], mode
+
+
+def inspect_archive_primary_apk(
+    archive_path: Path,
+    manifest: dict | None,
+) -> ApkManifestInfo | None:
+    with zipfile.ZipFile(archive_path) as archive:
+        apk_entries = [
+            name
+            for name in archive.namelist()
+            if not name.endswith("/") and PurePosixPath(name).name.lower().endswith(".apk")
+        ]
+        if not apk_entries:
+            return None
+
+        primary_entry, _ = choose_primary_apk_entry(apk_entries, manifest)
+        with TemporaryDirectory(prefix="crd-apk-artifact-") as temp_dir:
+            destination = Path(temp_dir) / PurePosixPath(primary_entry).name
+            with archive.open(primary_entry) as source:
+                copy_stream_to_path(source, destination)
+            return read_apk_manifest_info(destination)
+
+
+def discover_release_info_from_artifacts(artifacts: list[Path]) -> ApkManifestInfo | None:
+    archive_files = [
+        path for path in artifacts if path.suffix.lower() in SUPPORTED_SPLIT_ARCHIVE_SUFFIXES
+    ]
+    apk_files = [path for path in artifacts if path.suffix.lower() == ".apk"]
+
+    if len(archive_files) == 1 and not apk_files:
+        archive_manifest: dict | None
+        with zipfile.ZipFile(archive_files[0]) as archive:
+            archive_manifest = read_archive_manifest(archive)
+        manifest_info = parse_archive_manifest_info(archive_manifest)
+        if manifest_info is not None:
+            return manifest_info
+        return inspect_archive_primary_apk(archive_files[0], archive_manifest)
+
+    if apk_files:
+        primary_apk, _ = choose_primary_apk_path(apk_files)
+        return read_apk_manifest_info(primary_apk)
+
+    return None
+
+
+def reconcile_release_info_from_artifacts(
+    info: ReleaseInfo,
+    artifacts: list[Path],
+) -> ReleaseInfo:
+    try:
+        manifest_info = discover_release_info_from_artifacts(artifacts)
+    except SyncError as exc:
+        print(f"Artifact metadata inspection failed, keeping discovered release info: {exc}")
+        return info
+
+    if manifest_info is None:
+        return info
+    if manifest_info.package_name and manifest_info.package_name != PACKAGE_NAME:
+        print(
+            "Artifact metadata package mismatch, keeping discovered release info: "
+            f"{manifest_info.package_name}"
+        )
+        return info
+
+    resolved_version_name = manifest_info.version_name or info.version_name
+    resolved_version_code = manifest_info.version_code or info.version_code
+    if (
+        resolved_version_name == info.version_name
+        and resolved_version_code == info.version_code
+    ):
+        return info
+
+    print(
+        "Artifact metadata differs from discovery; "
+        f"using version {resolved_version_name} ({resolved_version_code}) "
+        f"instead of {info.version_name} ({info.version_code})."
+    )
+    return replace(
+        info,
+        version_name=resolved_version_name,
+        version_code=resolved_version_code,
+    )
 
 
 def convert_archive_to_apk(
@@ -531,10 +697,34 @@ def direct_download(
 
 
 def infer_split_id(path: Path) -> str:
+    try:
+        manifest_info = read_apk_manifest_info(path)
+    except SyncError as exc:
+        print(f"Could not inspect split id for {path.name}, falling back to filename: {exc}")
+        manifest_info = None
+
+    if manifest_info is not None:
+        if manifest_info.split_name:
+            return manifest_info.split_name
+        return "base"
+
     stem = path.stem
     if stem == "base":
         return "base"
     return stem.replace(".", "_")
+
+
+def build_split_manifest_entries(apk_files: Iterable[Path]) -> list[dict[str, str | int]]:
+    entries: list[dict[str, str | int]] = []
+    for path in sorted(apk_files):
+        entries.append(
+            {
+                "file": path.name,
+                "id": infer_split_id(path),
+                "size": path.stat().st_size,
+            }
+        )
+    return entries
 
 
 def package_split_apks(
@@ -557,14 +747,7 @@ def package_split_apks(
         "name": APP_NAME,
         "version_name": info.version_name,
         "version_code": info.version_code,
-        "split_apks": [
-            {
-                "file": path.name,
-                "id": infer_split_id(path),
-                "size": path.stat().st_size,
-            }
-            for path in apk_files
-        ],
+        "split_apks": build_split_manifest_entries(apk_files),
         "total_size": total_size,
     }
 
@@ -760,6 +943,7 @@ def main() -> int:
         artifacts = direct_download(session, info, download_dir)
         print(f"Downloaded artifact directly from APKPure for version {info.version_name}.")
 
+    info = reconcile_release_info_from_artifacts(info, artifacts)
     artifact = normalize_artifacts(artifacts, info, DIST_DIR)
     sha256 = file_sha256(artifact)
     write_latest_version_file(LATEST_VERSION_FILE, info)

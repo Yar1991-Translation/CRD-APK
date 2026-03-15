@@ -10,9 +10,12 @@ __pycache__/
 *.pyc
 .venv/
 .work/
+.tools/
 release-notes/
 converted-apks/
 merged-apks/
+converted-output/
+analysis-samples/
 .mergeapks/
 tools/
 android-14/

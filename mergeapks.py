@@ -6,6 +6,10 @@ import platform
 import shutil
 import subprocess
 import sys
+import zipfile
+import xml.etree.ElementTree as ET
+
+from pathlib import Path, PurePosixPath
 
 from subprocess import call, STDOUT
 try:
@@ -14,6 +18,11 @@ except ImportError:
     import os
     DEVNULL = open(os.devnull, 'wb')
 
+try:
+    from pyaxmlparser import APK
+except ImportError:  # pragma: no cover - exercised when dependencies are missing
+    APK = None
+
 
 const_dir_tmp = ".mergeapks"
 const_file_target_file = "target"
@@ -21,6 +30,22 @@ const_file_result_file = "result"
 const_ext_apk = ".apk"
 const_apk_file_apktool_config = 'apktool.yml'
 const_sign_config_properties_file = 'mergeapks.sign.properties'
+const_android_namespace = 'http://schemas.android.com/apk/res/android'
+const_android_attr_prefix = '{%s}' % const_android_namespace
+const_split_metadata_names = {
+    'com.android.vending.splits.required',
+    'com.android.vending.splits',
+}
+const_split_manifest_attributes = {
+    const_android_attr_prefix + 'isSplitRequired',
+    const_android_attr_prefix + 'requiredSplitTypes',
+    const_android_attr_prefix + 'splitTypes',
+    'split',
+}
+const_bundletool_signature_files = ('BNDLTOOL.RSA', 'BNDLTOOL.SF', 'MANIFEST.MF')
+const_bundletool_stamp_file = 'stamp-cert-sha256'
+
+ET.register_namespace('android', const_android_namespace)
 
 
 def print_help():
@@ -131,7 +156,7 @@ def get_do_not_compress_lines(config_file_lines):
 
 def parse_apktool_config(config_file_path):
     config_file_lines = list()
-    with open(config_file_path, 'r') as file:
+    with open(config_file_path, 'r', encoding='utf-8') as file:
         config_file_lines = file.readlines()
 
     do_not_compress_lines, do_not_compress_index_start, do_not_compress_index_end = get_do_not_compress_lines(config_file_lines)
@@ -163,7 +188,7 @@ def insert_new_lines_do_not_compress(config_file_path, lines_to_insert):
         config_file_lines_updated.append(config_file_line)
     config_file_lines_updated[config_file_lines_index_start:config_file_lines_index_end] = do_not_compress_lines_updated
 
-    with open(config_file_path, 'w') as file:
+    with open(config_file_path, 'w', encoding='utf-8') as file:
         file.writelines(config_file_lines_updated)
 
 
@@ -282,32 +307,152 @@ def delete_file_if_exists(path_to_file):
 
 
 def delete_signature_related_files(path_to_main_apk):
-    delete_file_if_exists(os.path.join(path_to_main_apk, 'original', 'META-INF', 'BNDLTOOL.RSA'))
-    delete_file_if_exists(os.path.join(path_to_main_apk, 'original', 'META-INF', 'BNDLTOOL.SF'))
-    delete_file_if_exists(os.path.join(path_to_main_apk, 'original', 'META-INF', 'MANIFEST.MF'))
+    for meta_inf_dir in (
+        os.path.join(path_to_main_apk, 'original', 'META-INF'),
+        os.path.join(path_to_main_apk, 'unknown', 'META-INF'),
+    ):
+        for signature_name in const_bundletool_signature_files:
+            delete_file_if_exists(os.path.join(meta_inf_dir, signature_name))
+    delete_file_if_exists(os.path.join(path_to_main_apk, const_bundletool_stamp_file))
+    delete_file_if_exists(os.path.join(path_to_main_apk, 'unknown', const_bundletool_stamp_file))
+
+
+def delete_split_related_files(path_to_main_apk):
+    split_xml_dir = Path(path_to_main_apk) / 'res' / 'xml'
+    if split_xml_dir.exists():
+        for split_resource in split_xml_dir.glob('splits*.xml'):
+            split_resource.unlink()
+
+    public_xml_path = Path(path_to_main_apk) / 'res' / 'values' / 'public.xml'
+    if public_xml_path.exists():
+        tree = ET.parse(public_xml_path)
+        resources_root = tree.getroot()
+        changed = False
+        for public_element in list(resources_root.findall('public')):
+            if (
+                public_element.attrib.get('type') == 'xml'
+                and public_element.attrib.get('name', '').startswith('splits')
+            ):
+                resources_root.remove(public_element)
+                changed = True
+        if changed:
+            tree.write(public_xml_path, encoding='utf-8', xml_declaration=True)
+
+
+def sanitize_manifest_tree(root):
+    changed = False
+
+    for attribute_name in const_split_manifest_attributes:
+        if attribute_name in root.attrib:
+            del root.attrib[attribute_name]
+            changed = True
+
+    application_element = root.find('application')
+    if application_element is not None:
+        for child in list(application_element):
+            if child.tag != 'meta-data':
+                continue
+            metadata_name = child.attrib.get(const_android_attr_prefix + 'name')
+            if metadata_name in const_split_metadata_names:
+                application_element.remove(child)
+                changed = True
+                continue
+            if (
+                metadata_name == 'com.android.stamp.type'
+                and child.attrib.get(const_android_attr_prefix + 'value') == 'STAMP_TYPE_DISTRIBUTION_APK'
+            ):
+                child.set(const_android_attr_prefix + 'value', 'STAMP_TYPE_STANDALONE_APK')
+                changed = True
+
+    for uses_split in list(root.findall('uses-split')):
+        root.remove(uses_split)
+        changed = True
+
+    return changed
 
 
 def update_main_manifest_file(path_main_apk):
     path_manifest = os.path.join(path_main_apk, 'AndroidManifest.xml')
-    data = None
+    tree = ET.parse(path_manifest)
+    sanitize_manifest_tree(tree.getroot())
+    tree.write(path_manifest, encoding='utf-8', xml_declaration=True)
 
-    application_propertry_splits_required_from = ' android:isSplitRequired="true" '
-    application_propertry_splits_required_to = ' '
-    metadata_google_play_splits_required_from = '<meta-data android:name="com.android.vending.splits.required" android:value="true"/>'
-    metadata_google_play_splits_required_to = ''
-    metadata_google_play_splits_list_from = '<meta-data android:name="com.android.vending.splits" android:resource="@xml/splits0"/>'
-    metadata_google_play_splits_list_to = ''
-    metadata_google_play_stamp_type_from = 'android:value="STAMP_TYPE_DISTRIBUTION_APK"'
-    metadata_google_play_stamp_type_to = 'android:value="STAMP_TYPE_STANDALONE_APK"'
 
-    with open(path_manifest, 'r') as file:
-        data = file.read()
-    data = data.replace(application_propertry_splits_required_from, application_propertry_splits_required_to)
-    data = data.replace(metadata_google_play_splits_required_from, metadata_google_play_splits_required_to)
-    data = data.replace(metadata_google_play_splits_list_from, metadata_google_play_splits_list_to)
-    data = data.replace(metadata_google_play_stamp_type_from, metadata_google_play_stamp_type_to)
-    with open(path_manifest, 'w') as file:
-        file.write(data)
+def require_apk_parser():
+    if APK is None:
+        raise Exception(
+            "pyaxmlparser is required to verify merged APKs. "
+            "Install dependencies from requirements.txt before running mergeapks.py."
+        )
+
+
+def read_binary_manifest_root(apk_file_path):
+    require_apk_parser()
+    parsed_apk = APK(str(apk_file_path))
+    if not parsed_apk.is_valid_APK():
+        raise Exception("failed to parse merged apk manifest")
+    return parsed_apk.get_android_manifest_xml()
+
+
+def get_local_name(attribute_name):
+    if '}' in attribute_name:
+        return attribute_name.rsplit('}', 1)[-1]
+    return attribute_name
+
+
+def collect_merged_apk_issues(apk_file_path):
+    issues = list()
+    manifest_root = read_binary_manifest_root(apk_file_path)
+
+    for attribute_name in sorted(const_split_manifest_attributes):
+        if attribute_name in manifest_root.attrib:
+            issues.append(
+                "manifest root still defines %s" % get_local_name(attribute_name)
+            )
+
+    application_element = manifest_root.find('application')
+    if application_element is not None:
+        for child in application_element.findall('meta-data'):
+            metadata_name = child.attrib.get(const_android_attr_prefix + 'name')
+            if metadata_name in const_split_metadata_names:
+                issues.append("application still defines %s" % metadata_name)
+
+    uses_split_elements = manifest_root.findall('uses-split')
+    if uses_split_elements:
+        issues.append("manifest still contains uses-split declarations")
+
+    with zipfile.ZipFile(apk_file_path) as archive:
+        split_resource_files = sorted(
+            name for name in archive.namelist()
+            if name.startswith('res/xml/splits') and name.endswith('.xml')
+        )
+        if split_resource_files:
+            issues.append(
+                "apk still contains split resource stubs: %s"
+                % ", ".join(split_resource_files)
+            )
+
+        bundletool_files = sorted(
+            name for name in archive.namelist()
+            if PurePosixPath(name).name == const_bundletool_stamp_file
+            or name.startswith('META-INF/BNDLTOOL')
+        )
+        if bundletool_files:
+            issues.append(
+                "apk still contains bundletool artifacts: %s"
+                % ", ".join(bundletool_files)
+            )
+
+    return issues
+
+
+def verify_merged_apk(apk_file_path):
+    issues = collect_merged_apk_issues(apk_file_path)
+    if issues:
+        raise Exception(
+            "merged apk still contains split install markers:\n- %s"
+            % "\n- ".join(issues)
+        )
 
 
 def load_sign_properties():
@@ -326,7 +471,7 @@ def load_sign_properties():
         checked_line = line.strip().replace('\r', '').replace('\n', '')
         if checked_line is None or checked_line == '' or line.startswith('#'):
             continue
-        line_parts = checked_line.split('=')
+        line_parts = checked_line.split('=', 1)
         if len(line_parts) != 2:
             continue
         property_key = line_parts[0].strip()
@@ -351,6 +496,7 @@ def build_single_apk(path_to_tmp_dir, path_to_main_apk_dir, should_sign_apk, sig
     zipalign_apk(path_to_tmp_dir)
     if should_sign_apk:
         sign_apk(path_to_tmp_dir, sign_config)
+    verify_merged_apk(os.path.join(path_to_tmp_dir, const_file_target_file + const_ext_apk))
 
 
 def copy_single_apk_to_working_dir(path_to_tmp_dir, path_to_working_dir, target_name):
@@ -426,6 +572,7 @@ def main():
         merge_apk_contents(path_apk_main, paths_apk_secondary)
 
     delete_signature_related_files(path_apk_main)
+    delete_split_related_files(path_apk_main)
     update_main_manifest_file(path_apk_main)
 
     build_single_apk(path_dir_tmp, path_apk_main, should_sign_apk, sign_properties)

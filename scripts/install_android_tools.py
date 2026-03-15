@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import platform
 import shutil
 import stat
 import time
@@ -64,7 +65,18 @@ def child_text(element: ET.Element, name: str) -> str:
     return ""
 
 
-def find_build_tools_archives() -> dict[str, str]:
+def detect_host_os() -> str:
+    system = platform.system().lower()
+    if system == "linux":
+        return "linux"
+    if system == "windows":
+        return "windows"
+    if system == "darwin":
+        return "macosx"
+    raise SystemExit(f"Unsupported host OS for Android build-tools: {platform.system()}")
+
+
+def find_build_tools_archives(host_os: str) -> dict[str, str]:
     root = ET.fromstring(request_bytes(ANDROID_REPO_XML))
     archives: dict[str, str] = {}
 
@@ -79,8 +91,8 @@ def find_build_tools_archives() -> dict[str, str]:
         for archive in package.iter():
             if local_name(archive.tag) != "archive":
                 continue
-            host_os = child_text(archive, "host-os")
-            if host_os and host_os != "linux":
+            archive_host_os = child_text(archive, "host-os")
+            if archive_host_os and archive_host_os != host_os:
                 continue
             relative_url = child_text(archive, "url")
             if relative_url:
@@ -94,9 +106,10 @@ def version_key(version: str) -> tuple[int, ...]:
 
 
 def resolve_build_tools_download(preferred_version: str) -> tuple[str, str]:
-    archives = find_build_tools_archives()
+    host_os = detect_host_os()
+    archives = find_build_tools_archives(host_os)
     if not archives:
-        raise SystemExit("Could not find any Linux Android build-tools archives.")
+        raise SystemExit(f"Could not find any {host_os} Android build-tools archives.")
 
     if preferred_version in archives:
         return preferred_version, archives[preferred_version]
@@ -110,6 +123,15 @@ def resolve_build_tools_download(preferred_version: str) -> tuple[str, str]:
 
 
 def create_exec_wrapper(wrapper_path: Path, target_path: Path) -> None:
+    if platform.system().lower() == "windows":
+        wrapper_path = wrapper_path.with_suffix(".cmd")
+        wrapper_path.write_text(
+            "@echo off\r\n"
+            f'"{target_path}" %*\r\n',
+            encoding="utf-8",
+        )
+        return
+
     wrapper_path.write_text(
         "#!/usr/bin/env bash\n"
         'set -euo pipefail\n'
@@ -119,13 +141,39 @@ def create_exec_wrapper(wrapper_path: Path, target_path: Path) -> None:
     wrapper_path.chmod(wrapper_path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
+def create_apktool_wrapper(wrapper_path: Path, apktool_jar: Path) -> None:
+    if platform.system().lower() == "windows":
+        wrapper_path = wrapper_path.with_suffix(".cmd")
+        wrapper_path.write_text(
+            "@echo off\r\n"
+            'set "SCRIPT_DIR=%~dp0"\r\n'
+            'java -jar "%SCRIPT_DIR%..\\apktool\\apktool.jar" %*\r\n',
+            encoding="utf-8",
+        )
+        return
+
+    wrapper_path.write_text(
+        "#!/usr/bin/env bash\n"
+        'set -euo pipefail\n'
+        'SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\n'
+        'exec java -jar "$SCRIPT_DIR/../apktool/apktool.jar" "$@"\n',
+        encoding="utf-8",
+    )
+    wrapper_path.chmod(wrapper_path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
 def locate_required_tool(root_dir: Path, tool_name: str) -> Path:
-    for candidate in root_dir.rglob(tool_name):
-        if candidate.is_file():
-            candidate.chmod(
-                candidate.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
-            )
-            return candidate.resolve()
+    candidate_names = [tool_name]
+    if platform.system().lower() == "windows":
+        candidate_names.extend([f"{tool_name}.exe", f"{tool_name}.bat", f"{tool_name}.cmd"])
+
+    for candidate_name in candidate_names:
+        for candidate in root_dir.rglob(candidate_name):
+            if candidate.is_file():
+                candidate.chmod(
+                    candidate.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+                )
+                return candidate.resolve()
     raise SystemExit(f"Could not find {tool_name} in extracted Android build-tools")
 
 
@@ -152,15 +200,7 @@ def main() -> int:
     apktool_jar = apktool_dir / "apktool.jar"
     download(apktool_asset["browser_download_url"], apktool_jar)
 
-    apktool_wrapper = bin_dir / "apktool"
-    apktool_wrapper.write_text(
-        "#!/usr/bin/env bash\n"
-        'set -euo pipefail\n'
-        'SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\n'
-        'exec java -jar "$SCRIPT_DIR/../apktool/apktool.jar" "$@"\n',
-        encoding="utf-8",
-    )
-    apktool_wrapper.chmod(apktool_wrapper.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    create_apktool_wrapper(bin_dir / "apktool", apktool_jar)
 
     resolved_version, build_tools_url = resolve_build_tools_download(args.build_tools_version)
     build_tools_zip = download_dir / f"build-tools-{resolved_version}.zip"

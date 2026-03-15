@@ -37,6 +37,9 @@ jobs:
       - name: Install Python dependencies
         run: python -m pip install --upgrade pip -r requirements.txt
 
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
       - name: Install apkeep
         run: |
           mkdir -p "$HOME/.local/bin"
@@ -66,24 +69,24 @@ jobs:
         env:
           MERGE_KEYSTORE: ${{ runner.temp }}/mergeapks/mergeapks.keystore
           MERGE_SIGN_PROPS: ${{ runner.temp }}/mergeapks/mergeapks.sign.properties
+          MERGE_KEYSTORE_BASE64: ${{ secrets.MERGEAPKS_KEYSTORE_BASE64 }}
+          MERGE_KEYSTORE_PASSWORD: ${{ secrets.MERGEAPKS_KEYSTORE_PASSWORD }}
+          MERGE_KEY_ALIAS: ${{ secrets.MERGEAPKS_KEY_ALIAS }}
+          MERGE_KEY_PASSWORD: ${{ secrets.MERGEAPKS_KEY_PASSWORD }}
         run: |
           set -euo pipefail
+          if [[ -z "${MERGE_KEYSTORE_BASE64}" || -z "${MERGE_KEYSTORE_PASSWORD}" || -z "${MERGE_KEY_ALIAS}" || -z "${MERGE_KEY_PASSWORD}" ]]; then
+            echo "::error::Missing stable merge signing secrets. Configure MERGEAPKS_KEYSTORE_BASE64, MERGEAPKS_KEYSTORE_PASSWORD, MERGEAPKS_KEY_ALIAS, and MERGEAPKS_KEY_PASSWORD."
+            exit 1
+          fi
           mkdir -p "$(dirname "$MERGE_KEYSTORE")"
-          keytool -genkeypair \
-            -keystore "$MERGE_KEYSTORE" \
-            -storepass "mergeapks123!" \
-            -keypass "mergeapks123!" \
-            -alias "mergeapks" \
-            -keyalg RSA \
-            -keysize 2048 \
-            -validity 3650 \
-            -dname "CN=RB-APK, OU=GitHub Actions, O=RB-APK, L=NA, ST=NA, C=US"
+          printf '%s' "$MERGE_KEYSTORE_BASE64" | base64 --decode > "$MERGE_KEYSTORE"
           python scripts/write_mergeapks_sign_properties.py \
             --output "$MERGE_SIGN_PROPS" \
             --keystore "$MERGE_KEYSTORE" \
-            --storepass "mergeapks123!" \
-            --alias "mergeapks" \
-            --keypass "mergeapks123!"
+            --storepass "$MERGE_KEYSTORE_PASSWORD" \
+            --alias "$MERGE_KEY_ALIAS" \
+            --keypass "$MERGE_KEY_PASSWORD"
 
       - name: Merge APK with apktool
         if: steps.sync.outputs.has_update == 'true'
